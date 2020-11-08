@@ -1,0 +1,660 @@
+use crate::{Assembler, AssemblerError, AssertType};
+use crate::expression::Expression;
+use crate::instruction::Instruction;
+use crate::section;
+use crate::symbol::Symbol;
+use crate::lexer;
+use lalrpop_util::ParseError;
+use std::cell::RefCell;
+use std::convert::TryFrom;
+
+grammar<'a>(asm: &'a Assembler<'_>, lexer_state: &RefCell<lexer::MutState>);
+
+pub Asm = <Line*>;
+
+// Utilities (macros & common scopes)
+
+List<T>: Vec<T> = {
+    <list:(<T> ",")*> <e:T> => {
+        let mut list = list;
+        list.push(e);
+        list
+    }
+}
+
+// Insert this one token before the first `string`
+// Example: `RawModeSwitch identifier List<string>`
+// (Note that `dummy` is a token *never* emitted by the lexer)
+// This will force LALRPOP to compute one token of lookahead (the `identifier` in the example)
+// before reducing this state, and ensuring the mode is switched at the right time
+// Yes, it's a hack. Yes, RGBASM's language definition sucks, and essentially requires this.
+RawModeSwitch: () = {
+    dummy? => {
+        lexer_state.borrow_mut().set_state(lexer::State::Raw);
+    }
+}
+
+// Root scope
+
+Line: () = {
+    LabelDecl? "\n",
+    LabelDecl? <instr:Instruction> "\n" => println!("{:?}", instr),
+    LabelDecl? MacroInvoc "\n",
+    LabelDecl? SimpleDirective "\n",
+    Directive "\n",
+    Conditional,
+}
+
+// Label declaration
+
+#[inline]
+LabelDecl: () = {
+    <name:ScopedLabel> ":" <export:":"?> => {
+        println!("Defining label {}", name);
+        // let mut sym = Symbol::new_label(name, 0);
+        // if let Some(_) = export {
+        //     sym.export();
+        // }
+        // // TODO: lalrpop is broken, can't handle this error...
+        // asm.add_symbol(sym);
+    },
+}
+
+// CPU instructions
+
+Instruction: Instruction = {
+    // Handle all arithmetic instructions together
+    <instr:ArithInstr> <rhs:OpAReg8> =>  Instruction::NoArg(0x80 | instr << 3 | rhs),
+    <instr:ArithInstr> <rhs:OpAImm8> =>  Instruction::Arg8(0xc6 | instr << 3, rhs),
+
+    // Handle extended instructions together
+    <instr:BitInstr> <bit:Expr> "," <reg:Reg8> => Instruction::Arg8(0xcb, instr | bit << 3 | reg),
+    <instr:BitModInstr> <reg:Reg8>   =>  Instruction::Arg8(0xcb, (instr | reg).into()),
+
+    // Handle conditional control flow instructions together
+    // Not `jr`, since it stores its operand differently (argh)
+    <instr:CtrlFlow> <cond:Condition> "," <addr:Expr> => Instruction::Arg16(instr | cond << 3, addr),
+
+    // Handle inc and dec together
+    <instr:IncDec> <reg:Reg8>         =>  Instruction::NoArg(0x04 | reg << 3 | instr),
+    <instr:IncDec> <reg:Reg16>        =>  Instruction::NoArg(0x03 | reg << 4 | instr << 3),
+
+    <instr:LdDI> "[" "hl" "]" "," A   =>  Instruction::NoArg(instr),
+    <instr:LdDI> A "," "[" "hl" "]"   =>  Instruction::NoArg(instr | 8),
+
+
+    "add" "hl" "," <rhs:Reg16>        =>  Instruction::NoArg(0x09 | rhs << 4),
+    "add" "sp" "," <rhs:Expr>         =>  Instruction::Arg8(0xe8, rhs),
+
+    "call" <addr:Expr>                =>  Instruction::Arg16(0xcd, addr),
+
+    "ccf"                             =>  Instruction::NoArg(0x3f),
+
+    "cpl"                             =>  Instruction::NoArg(0x2f),
+
+    "daa"                             =>  Instruction::NoArg(0x27),
+
+    "di"                              =>  Instruction::NoArg(0xf3),
+
+    "ei"                              =>  Instruction::NoArg(0xfb),
+
+    "halt"                            =>  Instruction::NoArg(0x3e),
+
+    "jp" <addr:Expr>                  =>  Instruction::Arg16(0xc3, addr),
+    "jp" "hl"                         =>  Instruction::NoArg(0xe9),
+
+    "jr" <addr:Expr>                  =>  Instruction::Jr(0x18, addr),
+    "jr" <cond:Condition> "," <addr:Expr>  => Instruction::Jr(0x20 | cond << 3, addr),
+
+    "ldh" A "," "[" <addr:Expr> "]"   =>  Instruction::Arg8(0xf0, addr.check_hram()),
+    "ldh" "[" <addr:Expr> "]" "," A   =>  Instruction::Arg8(0xe0, addr.check_hram()),
+    "ldh" A "," "[" C "]"             =>  Instruction::NoArg(0xf2),
+    "ldh" "[" C "]" "," A             =>  Instruction::NoArg(0xe2),
+
+    // ld r16, imm16
+    "ld" <reg:Reg16> "," <val:Expr>   =>  Instruction::Arg16(0x01 | reg << 4, val),
+    // ld hl, sp + ofs
+    "ld" "hl" "," "sp" "+" <ofs:Expr> =>  Instruction::Arg8(0xf8, ofs),
+    "ld" "hl" "," "sp" "-" <ofs:Expr> =>  Instruction::Arg8(0xf8, -ofs),
+    // ld sp, hl
+    "ld" "sp" "," "hl"                =>  Instruction::NoArg(0xf9),
+    // ld [mem16], sp
+    "ld" "[" <addr:Expr> "]" "," "sp" =>  Instruction::Arg16(0x08, addr),
+    // ld [mem16], a (and reverse)
+    // TODO: `optimizeloads`
+    "ld" "[" <addr:Expr> "]" "," A    =>  Instruction::Arg16(0xfa, addr),
+    "ld" A "," "[" <addr:Expr> "]"    =>  Instruction::Arg16(0xea, addr),
+    // TODO: $ff00+c
+    // ld [reg16], a (and reverse)
+    "ld" "[" <reg:MemReg> "]" "," A   =>  Instruction::NoArg(0x02 | reg << 4),
+    "ld" A "," "[" <reg:MemReg> "]"   =>  Instruction::NoArg(0x0a | reg << 4),
+    // ld r8, imm8
+    "ld" <lhs:Reg8> "," <rhs:Expr>    =>  Instruction::Arg8(0x06 | lhs << 3, rhs),
+    // ld r8, r8
+    <instr:LdReg8Reg8>                =>  Instruction::NoArg(instr),
+
+    "nop"                             =>  Instruction::NoArg(0x00),
+
+    <instr:PushPop> <reg:StackReg16>  =>  Instruction::NoArg(instr | reg << 4),
+
+    "reti"                            =>  Instruction::NoArg(0xd9),
+
+    "rla"                             =>  Instruction::NoArg(0x17),
+    "rlca"                            =>  Instruction::NoArg(0x07),
+    "rra"                             =>  Instruction::NoArg(0x1f),
+    "rrca"                            =>  Instruction::NoArg(0x0f),
+
+    "rst" <addr:Expr>                 =>  Instruction::Rst(addr),
+
+    "scf"                             =>  Instruction::NoArg(0x37),
+
+    "stop" <op:Expr?>                 =>  Instruction::Arg8(0x10, op.unwrap_or(0.into())),
+}
+
+ArithInstr: i32 = {
+    "add" => 0,
+    "adc" => 1,
+    "sub" => 2,
+    "sbc" => 3,
+    "and" => 4,
+    "xor" => 5,
+    "or"  => 6,
+    "cp"  => 7,
+}
+
+OpAImm8: Expression = {
+    A "," <Expr>,
+    <Expr>,
+}
+
+OpAReg8: i32 = {
+    A "," <Reg8>,
+    <Reg8>,
+}
+
+BitInstr: i32 = {
+    "bit" => 0x40,
+    "res" => 0x80,
+    "set" => 0xc0,
+}
+
+BitModInstr: i32 = {
+    "rlc"  => 0x00,
+    "rrc"  => 0x08,
+    "rl"   => 0x10,
+    "rr"   => 0x18,
+    "sla"  => 0x20,
+    "sra"  => 0x28,
+    "swap" => 0x30,
+    "srl"  => 0x38,
+}
+
+CtrlFlow: i32 = {
+    "ret"  => 0xc0,
+    "jp"   => 0xc2,
+    "call" => 0xc4,
+}
+
+Condition: i32 = {
+    "nz" => 0,
+    "z"  => 1,
+    "nc" => 2,
+    "c"  => 3,
+}
+
+IncDec: i32 = {
+    "inc" => 0,
+    "dec" => 1,
+}
+
+LdDI: i32 = {
+    "ldi" => 0x22,
+    "ldd" => 0x32,
+}
+
+MemReg: i32 = {
+    "bc"     => 0,
+    "de"     => 1,
+    "hli"    => 2,
+    "hl" "+" => 2,
+    "hld"    => 3,
+    "hl" "-" => 3,
+}
+
+LdReg8Reg8: i32 = {
+    "ld" <lhs:Reg8> "," <rhs:Reg8> =>?
+        if lhs == 6 && rhs == 6 {
+            Err(ParseError::User {
+                error: AssemblerError::LdHLHL,
+            })
+        } else {
+            Ok(0x40 | lhs << 3 | rhs)
+        },
+}
+
+PushPop: i32 = {
+    "pop"  => 0xc1,
+    "push" => 0xc5,
+}
+
+StackReg16: i32 = {
+    "bc" => 0,
+    "de" => 1,
+    "hl" => 2,
+    "af" => 3,
+}
+
+#[inline]
+Reg16: i32 = {
+    "bc" => 0,
+    "de" => 1,
+    "hl" => 2,
+    "sp" => 3,
+}
+
+#[inline]
+Reg8: i32 = {
+    B            => 0,
+    C            => 1,
+    D            => 2,
+    E            => 3,
+    H            => 4,
+    L            => 5,
+    "[" "hl" "]" => 6,
+    A            => 7,
+}
+
+B: () = {
+    "b",
+    "high" "(" "bc" ")",
+}
+C: () = {
+    "c",
+    "low" "(" "bc" ")",
+}
+D: () = {
+    "d",
+    "high" "(" "de" ")",
+}
+E: () = {
+    "e",
+    "low" "(" "de" ")",
+}
+H: () = {
+    "h",
+    "high" "(" "hl" ")",
+}
+L: () = {
+    "l",
+    "low" "(" "hl" ")",
+}
+A: () = {
+    "a",
+    "high" "(" "af" ")",
+}
+
+// Macro invocations
+
+MacroInvoc: () = {
+    RawModeSwitch <name:identifier> <args:List<string>?> => {
+        println!("Calling {} with args {:?}", name, args);
+        lexer_state.borrow_mut().set_state(lexer::State::Normal);
+    },
+}
+
+// Simple directives (can be prefixed with a label)
+
+SimpleDirective: () = {
+    "align" <align:Expr> <ofs:("," <Expr>)?> => unimplemented!(),
+
+    "assert" AssertParams,
+
+    "fail" String,
+
+    "include" String,
+
+    "load" SectionParams,
+
+    OptBegin => lexer_state.borrow_mut().set_state(lexer::State::Normal),
+
+    "popo",
+
+    "pops",
+
+    "pusho",
+
+    "pushs",
+
+    "printf" String,
+
+    "printi" String,
+
+    "printt" String,
+
+    "printv" String,
+
+    "section" SectionParams,
+
+    "shift" <amount:Expr?> => unimplemented!(),
+
+    "static_assert" AssertParams,
+
+    "warn" String,
+}
+
+AssertParams: (AssertType, Expression, Option<String>) = {
+    <assert_type:AssertType?> <expr:Expr> <msg:("," <String>)?> => (assert_type.unwrap_or(AssertType::Error), expr, msg),
+}
+
+AssertType: AssertType = {
+    "warn" => AssertType::Warn,
+    "fail" => AssertType::Error,
+    "fatal" => AssertType::Fatal,
+}
+
+SectionParams: (String, Option<Expression>) = {
+    <String> "," SectType <("[" <Expr> "]")?> // TODO
+}
+
+SectType: section::Type = {
+    "rom0"  => section::Type::Rom0,
+    "romx"  => section::Type::Romx,
+    "vram"  => section::Type::Vram,
+    "sram"  => section::Type::Sram,
+    "wram0" => section::Type::Wram0,
+    "wramx" => section::Type::Wramx,
+    "oam"   => section::Type::Oam,
+    "hram"  => section::Type::Hram,
+}
+
+OptBegin: () = {
+    "opt" => lexer_state.borrow_mut().set_state(lexer::State::Raw),
+}
+
+// Directives (can't be prefixed with a label)
+
+Directive: () = {
+    <name:label> "equ" <val:Expr>       =>? Ok(asm.add_symbol(Symbol::new_equ(name, i32::try_from(val)?))?),
+    <name:label> Assignment <val:Expr>  =>? Ok(asm.add_symbol(Symbol::new_set(name, i32::try_from(val)?))?),
+    <name:label> "rb" <val:Expr>        =>? {
+        let rs = asm.advance_rs(1 * i32::try_from(val)?);
+        Ok(asm.add_symbol(Symbol::new_equ(name, rs))?)
+    },
+    <name:label> "rw" <val:Expr>        =>? {
+        let rs = asm.advance_rs(2 * i32::try_from(val)?);
+        Ok(asm.add_symbol(Symbol::new_equ(name, rs))?)
+    },
+    <name:label> "rl" <val:Expr>        =>? {
+        let rs = asm.advance_rs(4 * i32::try_from(val)?);
+        Ok(asm.add_symbol(Symbol::new_equ(name, rs))?)
+    },
+    <name:label> "equs" <string:String> =>? Ok(asm.add_symbol(Symbol::new_equs(name, string))?),
+    <name:label> ":" "macro" => unimplemented!(),
+}
+
+#[inline]
+Assignment = {
+    "set",
+    "="
+}
+
+// Conditionals (very tricky)
+
+Conditional = {
+    "if",
+}
+
+// Common scopes
+
+Expr: Expression = {
+    <n:number> => n.into(),
+}
+
+#[inline]
+ScopedLabel = {
+    label,
+    local_label,
+}
+
+String: String = {
+    string,
+}
+
+// Lexer "import"
+
+extern {
+    type Location = lexer::Location;
+    type Error = crate::AssemblerError;
+
+    // IMPORTANT NOTE
+    // This is used by the build script (build.rs) to generate the `impl Display for lexer::TokType`
+    // Thus, this enum is expected to *always* be formatted as such:
+    // ```
+    // "display string" <whitespace> => <whitespace> lexer::TokType::<token type>,
+    // ```
+    // (Quotes may be omitted)
+    // Lines not formatted as such will be ignored entirely, until the closing brace.
+    //
+    // !!! Note that everything up to the first such line is treated as a keyword!
+    enum lexer::TokType {
+        "adc"           => lexer::TokType::Adc,
+        "add"           => lexer::TokType::Add,
+        "and"           => lexer::TokType::And,
+        "bit"           => lexer::TokType::Bit,
+        "call"          => lexer::TokType::Call,
+        "ccf"           => lexer::TokType::Ccf,
+        "cpl"           => lexer::TokType::Cpl,
+        "cp"            => lexer::TokType::Cp,
+        "daa"           => lexer::TokType::Daa,
+        "dec"           => lexer::TokType::Dec,
+        "di"            => lexer::TokType::Di,
+        "ei"            => lexer::TokType::Ei,
+        "halt"          => lexer::TokType::Halt,
+        "inc"           => lexer::TokType::Inc,
+        "jp"            => lexer::TokType::Jp,
+        "jr"            => lexer::TokType::Jr,
+        "ld"            => lexer::TokType::Ld,
+        "ldi"           => lexer::TokType::Ldi,
+        "ldd"           => lexer::TokType::Ldd,
+        "ldio"          => lexer::TokType::Ldio,
+        "ldh"           => lexer::TokType::Ldh,
+        "nop"           => lexer::TokType::Nop,
+        "or"            => lexer::TokType::Or,
+        "pop"           => lexer::TokType::Pop,
+        "push"          => lexer::TokType::Push,
+        "res"           => lexer::TokType::Res,
+        "reti"          => lexer::TokType::Reti,
+        "ret"           => lexer::TokType::Ret,
+        "rlca"          => lexer::TokType::Rlca,
+        "rlc"           => lexer::TokType::Rlc,
+        "rla"           => lexer::TokType::Rla,
+        "rl"            => lexer::TokType::Rl,
+        "rrc"           => lexer::TokType::Rrc,
+        "rrca"          => lexer::TokType::Rrca,
+        "rra"           => lexer::TokType::Rra,
+        "rr"            => lexer::TokType::Rr,
+        "rst"           => lexer::TokType::Rst,
+        "sbc"           => lexer::TokType::Sbc,
+        "scf"           => lexer::TokType::Scf,
+        "set"           => lexer::TokType::Set,
+        "sla"           => lexer::TokType::Sla,
+        "sra"           => lexer::TokType::Sra,
+        "srl"           => lexer::TokType::Srl,
+        "stop"          => lexer::TokType::Stop,
+        "sub"           => lexer::TokType::Sub,
+        "swap"          => lexer::TokType::Swap,
+        "xor"           => lexer::TokType::Xor,
+
+        "nz"            => lexer::TokType::Nz,
+        "z"             => lexer::TokType::Z,
+        "nc"            => lexer::TokType::Nc,
+
+        "af"            => lexer::TokType::Af,
+        "bc"            => lexer::TokType::Bc,
+        "de"            => lexer::TokType::De,
+        "hl"            => lexer::TokType::Hl,
+        "sp"            => lexer::TokType::Sp,
+        "hld"           => lexer::TokType::Hld,
+        "hli"           => lexer::TokType::Hli,
+
+        "a"             => lexer::TokType::A,
+        "b"             => lexer::TokType::B,
+        "c"             => lexer::TokType::C,
+        "d"             => lexer::TokType::D,
+        "e"             => lexer::TokType::E,
+        "h"             => lexer::TokType::H,
+        "l"             => lexer::TokType::L,
+
+        "def"           => lexer::TokType::Def,
+
+        "fragment"      => lexer::TokType::Fragment,
+        "bank"          => lexer::TokType::Bank,
+        "align"         => lexer::TokType::Align,
+
+        "round"         => lexer::TokType::Round,
+        "ceil"          => lexer::TokType::Ceil,
+        "floor"         => lexer::TokType::Floor,
+        "div"           => lexer::TokType::Div,
+        "mul"           => lexer::TokType::Mul,
+        "sin"           => lexer::TokType::Sin,
+        "cos"           => lexer::TokType::Cos,
+        "tan"           => lexer::TokType::Tan,
+        "asin"          => lexer::TokType::Asin,
+        "acos"          => lexer::TokType::Acos,
+        "atan"          => lexer::TokType::Atan,
+        "atan2"         => lexer::TokType::Atan2,
+
+        "high"          => lexer::TokType::High,
+        "low"           => lexer::TokType::Low,
+        "isconst"       => lexer::TokType::Isconst,
+
+        "strcmp"        => lexer::TokType::Strcmp,
+        "strin"         => lexer::TokType::Strin,
+        "strsub"        => lexer::TokType::Strsub,
+        "strlen"        => lexer::TokType::Strlen,
+        "strcat"        => lexer::TokType::Strcat,
+        "strupr"        => lexer::TokType::Strupr,
+        "strlwr"        => lexer::TokType::Strlwr,
+
+        "include"       => lexer::TokType::Include,
+        "printt"        => lexer::TokType::Printt,
+        "printi"        => lexer::TokType::Printi,
+        "printv"        => lexer::TokType::Printv,
+        "printf"        => lexer::TokType::Printf,
+        "export"        => lexer::TokType::Export,
+        "xdef"          => lexer::TokType::Xdef,
+        "global"        => lexer::TokType::Global,
+        "ds"            => lexer::TokType::Ds,
+        "db"            => lexer::TokType::Db,
+        "dw"            => lexer::TokType::Dw,
+        "dl"            => lexer::TokType::Dl,
+        "section"       => lexer::TokType::Section,
+        "purge"         => lexer::TokType::Purge,
+
+        "rsreset"       => lexer::TokType::Rsreset,
+        "rsset"         => lexer::TokType::Rsset,
+
+        "incbin"        => lexer::TokType::Incbin,
+        "charmap"       => lexer::TokType::Charmap,
+        "newcharmap"    => lexer::TokType::Newcharmap,
+        "setcharmap"    => lexer::TokType::Setcharmap,
+        "pushc"         => lexer::TokType::Pushc,
+        "popc"          => lexer::TokType::Popc,
+
+        "fail"          => lexer::TokType::Fail,
+        "warn"          => lexer::TokType::Warn,
+        "fatal"         => lexer::TokType::Fatal,
+        "assert"        => lexer::TokType::Assert,
+        "static_assert" => lexer::TokType::StaticAssert,
+
+        "macro"         => lexer::TokType::Macro,
+        "endm"          => lexer::TokType::Endm,
+        "shift"         => lexer::TokType::Shift,
+
+        "rept"          => lexer::TokType::Rept,
+        "endr"          => lexer::TokType::Endr,
+
+        "load"          => lexer::TokType::Load,
+        "endl"          => lexer::TokType::Endl,
+
+        "if"            => lexer::TokType::If,
+        "else"          => lexer::TokType::Else,
+        "elif"          => lexer::TokType::Elif,
+        "endc"          => lexer::TokType::Endc,
+
+        "union"         => lexer::TokType::Union,
+        "nextu"         => lexer::TokType::Nextu,
+        "endu"          => lexer::TokType::Endu,
+
+        "wram0"         => lexer::TokType::Wram0,
+        "vram"          => lexer::TokType::Vram,
+        "romx"          => lexer::TokType::Romx,
+        "rom0"          => lexer::TokType::Rom0,
+        "hram"          => lexer::TokType::Hram,
+        "wramx"         => lexer::TokType::Wramx,
+        "sram"          => lexer::TokType::Sram,
+        "oam"           => lexer::TokType::Oam,
+
+        "rb"            => lexer::TokType::Rb,
+        "rw"            => lexer::TokType::Rw,
+        "equ"           => lexer::TokType::Equ,
+        "equs"          => lexer::TokType::Equs,
+
+        "pushs"         => lexer::TokType::Pushs,
+        "pops"          => lexer::TokType::Pops,
+        "pusho"         => lexer::TokType::Pusho,
+        "popo"          => lexer::TokType::Popo,
+
+        "opt"           => lexer::TokType::Opt,
+
+        // Punctuation
+        "("             => lexer::TokType::Lparen,
+        ")"             => lexer::TokType::Rparen,
+        "["             => lexer::TokType::Lbrack,
+        "]"             => lexer::TokType::Rbrack,
+        ","             => lexer::TokType::Comma,
+        ":"             => lexer::TokType::Colon,
+
+        // Operators
+        //   Boolean
+        "!"             => lexer::TokType::OpNot,
+        "&&"            => lexer::TokType::OpAnd,
+        "||"            => lexer::TokType::OpOr,
+        //   Binary
+        "~"             => lexer::TokType::OpBinNot,
+        "&"             => lexer::TokType::OpBinAnd,
+        "|"             => lexer::TokType::OpBinOr,
+        "^"             => lexer::TokType::OpBinXor,
+        //   Arithmetic
+        "+"             => lexer::TokType::OpAdd,
+        "-"             => lexer::TokType::OpSub,
+        "*"             => lexer::TokType::OpMul,
+        "/"             => lexer::TokType::OpDiv,
+        "%"             => lexer::TokType::OpMod,
+        //   Comparison
+        "=="            => lexer::TokType::OpEq,
+        "!="            => lexer::TokType::OpNeq,
+        "<"             => lexer::TokType::OpLt,
+        "<="            => lexer::TokType::OpLte,
+        ">"             => lexer::TokType::OpGt,
+        ">="            => lexer::TokType::OpGte,
+
+        // Values
+        number          => lexer::TokType::Num(<i32>),
+        string          => lexer::TokType::String(<String>),
+        identifier      => lexer::TokType::Ident(<String>),
+        local_identifier=> lexer::TokType::LocalIdent(<String>),
+        label           => lexer::TokType::Label(<String>),
+        local_label     => lexer::TokType::LocalLabel(<String>),
+
+        // EOL
+        "\r"            => lexer::TokType::CarriageRet,
+        "\n"            => lexer::TokType::Newline,
+
+        // TODO: categorize
+        "="             => lexer::TokType::Assign,
+
+        // Hack
+        dummy           => lexer::TokType::Dummy,
+    }
+}
